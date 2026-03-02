@@ -8,7 +8,7 @@
 
 ### web_search
 
-同时查询 Brave、搜狗、DuckDuckGo 三个搜索引擎，自动合并去重、过滤广告。
+同时查询 Brave、DuckDuckGo 两个搜索引擎，自动合并去重、过滤广告。
 
 - **入参**: `query`（搜索关键词）、`num_results`（返回数量，默认 8）
 - **返回**: `{ url, title, summary }[]`

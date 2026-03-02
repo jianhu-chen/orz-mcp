@@ -9,7 +9,7 @@
  * 特性:
  * - 支持 HTTP/HTTPS 代理（命令行参数 --proxy 或环境变量兜底）
  *   方便国内用户通过 VPN 访问 Brave 等海外搜索引擎
- * - 同时查询 Brave、搜狗、DuckDuckGo，合并去重
+ * - 同时查询 Brave、DuckDuckGo，合并去重
  * - 抓取网页内容，可选简化为 Markdown
  *
  * 使用:
@@ -253,51 +253,6 @@ function parseBrave(html) {
   return results;
 }
 
-/** 搜狗搜索 */
-function parseSogou(html) {
-  const results = [];
-  const blocks = html.split('class="vrwrap"');
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i].substring(0, 5000);
-
-    const h3Match = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
-    if (!h3Match) continue;
-
-    const linkMatch = h3Match[1].match(
-      /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/
-    );
-    if (!linkMatch) continue;
-
-    let url = decodeHtmlEntities(linkMatch[1]);
-    const title = stripHtml(linkMatch[2]);
-    if (!title) continue;
-
-    if (url.startsWith("/link?")) {
-      url = "https://www.sogou.com" + url;
-    }
-
-    let summary = "";
-    const summaryPatterns = [
-      /class="[^"]*text-layout[^"]*"[^>]*>([\s\S]*?)<\/div>/,
-      /class="[^"]*summary[^"]*"[^>]*>([\s\S]*?)<\/div>/,
-      /class="[^"]*str[-_]text[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/,
-    ];
-    for (const pat of summaryPatterns) {
-      const m = block.match(pat);
-      if (m) {
-        const text = stripHtml(m[1]);
-        if (text.length > 10) {
-          summary = text;
-          break;
-        }
-      }
-    }
-
-    results.push({ url, title, summary });
-  }
-  return results;
-}
-
 /** DuckDuckGo */
 function parseDuckDuckGo(html) {
   const results = [];
@@ -367,21 +322,6 @@ async function searchBrave(query) {
   }
 }
 
-async function searchSogou(query) {
-  try {
-    const url = `https://www.sogou.com/web?query=${encodeURIComponent(query)}`;
-    const resp = await proxyFetch(url, {
-      headers: getBrowserHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!resp.ok) return [];
-    return parseSogou(await resp.text());
-  } catch (e) {
-    console.error("[Sogou] search error:", e.message);
-    return [];
-  }
-}
-
 async function searchDuckDuckGo(query) {
   try {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
@@ -445,16 +385,14 @@ function mergeAndDeduplicate(allResults, maxResults) {
 async function webSearch(query, numResults = 8) {
   console.error(`[web_search] query="${query}", numResults=${numResults}`);
 
-  const [brave, sogou, ddg] = await Promise.allSettled([
+  const [brave, ddg] = await Promise.allSettled([
     searchBrave(query),
-    searchSogou(query),
     searchDuckDuckGo(query),
   ]);
 
   const allResults = [];
   const engines = [
     ["Brave", brave],
-    ["Sogou", sogou],
     ["DuckDuckGo", ddg],
   ];
   for (const [name, result] of engines) {
@@ -566,7 +504,7 @@ const TOOLS = [
   {
     name: "web_search",
     description:
-      "Search the web using multiple search engines (Brave, Sogou, DuckDuckGo) simultaneously. " +
+      "Search the web using multiple search engines (Brave, DuckDuckGo) simultaneously. " +
       "Results are deduplicated and ads are filtered out. " +
       "Returns an array of search results with url, title, and summary.",
     inputSchema: {
@@ -583,6 +521,33 @@ const TOOLS = [
         },
       },
       required: ["query"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+        },
+        num_results: {
+          type: "number",
+        },
+        total: {
+          type: "number",
+        },
+        results: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              title: { type: "string" },
+              summary: { type: "string" },
+            },
+            required: ["url", "title", "summary"],
+          },
+        },
+      },
+      required: ["query", "num_results", "total", "results"],
     },
   },
   {
@@ -613,6 +578,24 @@ const TOOLS = [
       },
       required: ["url"],
     },
+    outputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+        },
+        simplify: {
+          type: "boolean",
+        },
+        content_length: {
+          type: "number",
+        },
+        content: {
+          type: "string",
+        },
+      },
+      required: ["url", "simplify", "content_length", "content"],
+    },
   },
 ];
 
@@ -635,6 +618,12 @@ async function handleToolCall(name, args) {
         const results = await webSearch(query, numResults);
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+          structuredContent: {
+            query,
+            num_results: numResults,
+            total: results.length,
+            results,
+          },
         };
       } catch (e) {
         return {
@@ -655,7 +644,15 @@ async function handleToolCall(name, args) {
       }
       try {
         const content = await webFetch(url, maxCharSize, simplify);
-        return { content: [{ type: "text", text: content }] };
+        return {
+          content: [{ type: "text", text: content }],
+          structuredContent: {
+            url,
+            simplify,
+            content_length: content.length,
+            content,
+          },
+        };
       } catch (e) {
         return {
           content: [{ type: "text", text: `Error: ${e.message}` }],
