@@ -2,13 +2,12 @@
  * ORZ MCP Server - Web Search & Fetch MCP Tool (Netlify Functions)
  *
  * MCP server setup with web_search and web_fetch tools.
- * - web_search: Brave, Sogou, DuckDuckGo simultaneous search with dedup
+ * - web_search: Brave, DuckDuckGo simultaneous search with dedup
  * - web_fetch: Fetch web page content, optionally simplified to Markdown
  */
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import TurndownService from "turndown";
 
 // ============================================================================
@@ -52,6 +51,12 @@ interface SearchItem {
   title: string;
   summary: string;
 }
+
+const searchItemSchema = z.object({
+  url: z.string(),
+  title: z.string(),
+  summary: z.string(),
+});
 
 // ============================================================================
 // HTML entity decoding
@@ -151,44 +156,6 @@ function parseBrave(html: string): SearchItem[] {
   return results;
 }
 
-function parseSogou(html: string): SearchItem[] {
-  const results: SearchItem[] = [];
-  const blocks = html.split('class="vrwrap"');
-  for (let i = 1; i < blocks.length; i++) {
-    const block = blocks[i].substring(0, 5000);
-    const h3Match = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
-    if (!h3Match) continue;
-    const linkMatch = h3Match[1].match(
-      /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/
-    );
-    if (!linkMatch) continue;
-    let url = decodeHtmlEntities(linkMatch[1]);
-    const title = stripHtml(linkMatch[2]);
-    if (!title) continue;
-    if (url.startsWith("/link?")) {
-      url = "https://www.sogou.com" + url;
-    }
-    let summary = "";
-    const summaryPatterns = [
-      /class="[^"]*text-layout[^"]*"[^>]*>([\s\S]*?)<\/div>/,
-      /class="[^"]*summary[^"]*"[^>]*>([\s\S]*?)<\/div>/,
-      /class="[^"]*str[-_]text[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/,
-    ];
-    for (const pat of summaryPatterns) {
-      const m = block.match(pat);
-      if (m) {
-        const text = stripHtml(m[1]);
-        if (text.length > 10) {
-          summary = text;
-          break;
-        }
-      }
-    }
-    results.push({ url, title, summary });
-  }
-  return results;
-}
-
 function parseDuckDuckGo(html: string): SearchItem[] {
   const results: SearchItem[] = [];
   if (
@@ -253,22 +220,6 @@ async function searchBrave(query: string): Promise<SearchItem[]> {
     return parseBrave(html);
   } catch (e) {
     console.error("[Brave] search error:", (e as Error).message);
-    return [];
-  }
-}
-
-async function searchSogou(query: string): Promise<SearchItem[]> {
-  try {
-    const url = `https://www.sogou.com/web?query=${encodeURIComponent(query)}`;
-    const resp = await fetch(url, {
-      headers: getBrowserHeaders(),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!resp.ok) return [];
-    const html = await resp.text();
-    return parseSogou(html);
-  } catch (e) {
-    console.error("[Sogou] search error:", (e as Error).message);
     return [];
   }
 }
@@ -355,7 +306,6 @@ async function webSearch(
   console.log(`[web_search] query="${query}", numResults=${numResults}`);
   const [brave, ddg] = await Promise.allSettled([
     searchBrave(query),
-    // searchSogou(query), // TODO: 搜狗在 Netlify 上搜索非常慢，暂时禁用
     searchDuckDuckGo(query),
   ]);
   const allResults: SearchItem[][] = [];
@@ -507,23 +457,33 @@ export const setupMCPServer = (): McpServer => {
   );
 
   // Tool: web_search
-  server.tool(
+  server.registerTool(
     "web_search",
-    "Search the web using multiple search engines (Brave, Sogou, DuckDuckGo) simultaneously. " +
-      "Results are deduplicated and ads are filtered out. " +
-      "Returns an array of search results with url, title, and summary.",
     {
-      query: z
-        .string()
-        .describe(
-          "Search keywords separated by spaces, e.g. 'deno mcp server'"
-        ),
-      num_results: z
-        .number()
-        .describe("Number of results to return (default: 8)")
-        .default(8),
+      title: "Web Search",
+      description:
+        "Search the web using multiple search engines (Brave, DuckDuckGo) simultaneously. " +
+        "Results are deduplicated and ads are filtered out. " +
+        "Returns an array of search results with url, title, and summary.",
+      inputSchema: {
+        query: z
+          .string()
+          .describe(
+            "Search keywords separated by spaces, e.g. 'deno mcp server'"
+          ),
+        num_results: z
+          .number()
+          .describe("Number of results to return (default: 8)")
+          .default(8),
+      },
+      outputSchema: {
+        query: z.string(),
+        num_results: z.number(),
+        total: z.number(),
+        results: z.array(searchItemSchema),
+      },
     },
-    async ({ query, num_results }): Promise<CallToolResult> => {
+    async ({ query, num_results }) => {
       if (!query || query.trim() === "") {
         return {
           content: [
@@ -538,9 +498,13 @@ export const setupMCPServer = (): McpServer => {
       try {
         const results = await webSearch(query, num_results);
         return {
-          content: [
-            { type: "text", text: JSON.stringify(results, null, 2) },
-          ],
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+          structuredContent: {
+            query,
+            num_results,
+            total: results.length,
+            results,
+          },
         };
       } catch (e) {
         return {
@@ -554,28 +518,38 @@ export const setupMCPServer = (): McpServer => {
   );
 
   // Tool: web_fetch
-  server.tool(
+  server.registerTool(
     "web_fetch",
-    "Fetch a web page and return its content. " +
-      "When simplify is enabled (default), removes useless HTML tags (script, style, iframe, etc.), " +
-      "extracts the main content, and converts it to clean Markdown format. " +
-      "Has a 10-second timeout.",
     {
-      url: z.string().describe("The URL to fetch"),
-      max_char_size: z
-        .number()
-        .describe(
-          "Maximum character size of the returned content (default: 50000)"
-        )
-        .default(50000),
-      simplify: z
-        .boolean()
-        .describe(
-          "Whether to simplify the content by removing useless tags and converting to Markdown (default: true)"
-        )
-        .default(true),
+      title: "Web Fetch",
+      description:
+        "Fetch a web page and return its content. " +
+        "When simplify is enabled (default), removes useless HTML tags (script, style, iframe, etc.), " +
+        "extracts the main content, and converts it to clean Markdown format. " +
+        "Has a 10-second timeout.",
+      inputSchema: {
+        url: z.string().describe("The URL to fetch"),
+        max_char_size: z
+          .number()
+          .describe(
+            "Maximum character size of the returned content (default: 50000)"
+          )
+          .default(50000),
+        simplify: z
+          .boolean()
+          .describe(
+            "Whether to simplify the content by removing useless tags and converting to Markdown (default: true)"
+          )
+          .default(true),
+      },
+      outputSchema: {
+        url: z.string(),
+        simplify: z.boolean(),
+        content_length: z.number(),
+        content: z.string(),
+      },
     },
-    async ({ url, max_char_size, simplify }): Promise<CallToolResult> => {
+    async ({ url, max_char_size, simplify }) => {
       if (!url || url.trim() === "") {
         return {
           content: [
@@ -591,6 +565,12 @@ export const setupMCPServer = (): McpServer => {
         const content = await webFetch(url, max_char_size, simplify);
         return {
           content: [{ type: "text", text: content }],
+          structuredContent: {
+            url,
+            simplify,
+            content_length: content.length,
+            content,
+          },
         };
       } catch (e) {
         return {
